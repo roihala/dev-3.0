@@ -75,7 +75,27 @@ function decodePayload(b64: string): JwtPayload | null {
  */
 export async function initSecret(): Promise<void> {
 	if (secret) return;
-	const raw = crypto.getRandomValues(new Uint8Array(32));
+	let raw: Uint8Array;
+	const { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync } = await import("node:fs");
+	const { dirname } = await import("node:path");
+	const { DEV3_HOME } = await import("./paths");
+	const secretPath = `${DEV3_HOME}/jwt-secret`;
+	if (existsSync(secretPath)) {
+		const buf = readFileSync(secretPath);
+		if (buf.length === 32) {
+			raw = new Uint8Array(buf);
+		} else {
+			raw = crypto.getRandomValues(new Uint8Array(32));
+			mkdirSync(dirname(secretPath), { recursive: true });
+			writeFileSync(secretPath, raw);
+			chmodSync(secretPath, 0o600);
+		}
+	} else {
+		raw = crypto.getRandomValues(new Uint8Array(32));
+		mkdirSync(dirname(secretPath), { recursive: true });
+		writeFileSync(secretPath, raw);
+		chmodSync(secretPath, 0o600);
+	}
 	secret = await crypto.subtle.importKey(
 		"raw",
 		raw,
