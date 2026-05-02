@@ -107,22 +107,42 @@ function initBrowserApi(): ApiShape {
 	const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 	const isViteDevServer = window.location.port === "5173";
 
-	// ── JWT session token (in-memory only) ──
-	let sessionToken: string | null = null;
+	// ── JWT session token ──
+	// Persisted to localStorage so a page reload doesn't drop the session.
+	// Without this the SPA would lose its in-memory token on every refresh
+	// (the QR token is stripped from the URL after first use), forcing the
+	// user to re-paste the ?token= URL each time.
+	const SESSION_STORAGE_KEY = "dev3.sessionToken";
+	function loadStoredSession(): string | null {
+		try { return window.localStorage.getItem(SESSION_STORAGE_KEY); } catch { return null; }
+	}
+	function storeSession(token: string | null): void {
+		try {
+			if (token) window.localStorage.setItem(SESSION_STORAGE_KEY, token);
+			else window.localStorage.removeItem(SESSION_STORAGE_KEY);
+		} catch { /* private mode / disabled storage */ }
+	}
+	let sessionToken: string | null = loadStoredSession();
 	let authReady: Promise<void>;
 
 	// Extract QR token from URL and clean it from the address bar
 	const urlParams = new URLSearchParams(window.location.search);
 	const qrToken = urlParams.get("token") || "";
-	console.log("[browser-rpc] init", { isViteDevServer, hasQrToken: !!qrToken, protocol: wsProtocol });
+	console.log("[browser-rpc] init", { isViteDevServer, hasQrToken: !!qrToken, hasStoredSession: !!sessionToken, protocol: wsProtocol });
 	if (qrToken) {
 		window.history.replaceState({}, "", window.location.pathname);
 	}
 
 	// Exchange QR token for session token
 	async function authenticate(): Promise<void> {
-		if (isViteDevServer || !qrToken) {
-			console.log("[browser-rpc] auth skip", { isViteDevServer, hasToken: !!qrToken });
+		if (isViteDevServer) {
+			console.log("[browser-rpc] auth skip (vite dev)");
+			return;
+		}
+		if (!qrToken) {
+			// No fresh QR token — try the stored session if any. If it's stale
+			// we'll discover it on the WS upgrade (401) and clear it there.
+			console.log("[browser-rpc] auth skip (no QR token)", { hasStoredSession: !!sessionToken });
 			return;
 		}
 		console.log("[browser-rpc] Exchanging QR token...");
@@ -135,9 +155,12 @@ function initBrowserApi(): ApiShape {
 			if (resp.ok) {
 				const data = await resp.json();
 				sessionToken = data.token;
+				storeSession(sessionToken);
 				console.log("[browser-rpc] Auth OK, got session token");
 			} else {
 				console.error("[browser-rpc] Token exchange failed:", resp.status);
+				sessionToken = null;
+				storeSession(null);
 				window.dispatchEvent(new CustomEvent("rpc:authFailed", { detail: { status: resp.status } }));
 			}
 		} catch (err) {
@@ -159,7 +182,13 @@ function initBrowserApi(): ApiShape {
 				if (resp.ok) {
 					const data = await resp.json();
 					sessionToken = data.token;
+					storeSession(sessionToken);
 					console.log("[browser-rpc] Session token refreshed");
+				} else if (resp.status === 401) {
+					// Stored session is stale — drop it so we don't keep retrying.
+					sessionToken = null;
+					storeSession(null);
+					window.dispatchEvent(new CustomEvent("rpc:authFailed", { detail: { status: resp.status } }));
 				}
 			} catch {
 				// Will retry on next interval
@@ -201,14 +230,17 @@ function initBrowserApi(): ApiShape {
 		}
 	}
 
+	let wsEverOpened = false;
 	function connect() {
 		const wsUrl = buildWsUrl("/rpc");
 		console.log("[browser-rpc] Connecting WS to", wsUrl.replace(/token=[^&]+/, "token=***"));
 		resetWsReady();
+		wsEverOpened = false;
 		ws = new WebSocket(wsUrl);
 
 		ws.addEventListener("open", () => {
 			console.log("[browser-rpc] WS OPEN");
+			wsEverOpened = true;
 			wsReadyResolve?.();
 		});
 
@@ -236,10 +268,19 @@ function initBrowserApi(): ApiShape {
 		});
 
 		ws.addEventListener("close", (event) => {
-			console.warn("[browser-rpc] WS CLOSED", { code: event.code, reason: event.reason, hasToken: !!sessionToken });
+			console.warn("[browser-rpc] WS CLOSED", { code: event.code, reason: event.reason, hasToken: !!sessionToken, everOpened: wsEverOpened });
 			rejectPendingRequests(
 				new Error(`RPC connection closed (code ${event.code}${event.reason ? `: ${event.reason}` : ""})`),
 			);
+			// If the connection closed without ever opening AND we had a token, the
+			// server rejected our credentials at the upgrade step (401). The token is
+			// stale — drop it so we don't loop, and tell the UI to prompt for re-auth.
+			if (!wsEverOpened && sessionToken) {
+				console.warn("[browser-rpc] WS rejected at upgrade — clearing stale session");
+				sessionToken = null;
+				storeSession(null);
+				window.dispatchEvent(new CustomEvent("rpc:authFailed", { detail: { status: 401, reason: "stale-session" } }));
+			}
 			// Only reconnect if we have a valid session token (or are in Vite dev mode).
 			// Without a token the server returns 401 and we'd loop forever.
 			if (isViteDevServer || sessionToken) {
